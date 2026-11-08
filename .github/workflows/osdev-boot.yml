@@ -68,7 +68,22 @@ jobs:
           gcc -m32 -ffreestanding -c /tmp/t.c -o /tmp/t.o && echo '-m32 ok'
 
       - name: Build (make all)
-        run: make all 2>&1 | tee build.log
+        run: |
+          # `git ls-files` first, because this is the finding that the first
+          # run of this workflow produced: vineetp6 committed the *build
+          # products* (boot.asm.bin, loader.bin, loader.o, boot.bin) next to
+          # their sources. A fresh checkout then has those targets newer than
+          # the sources, so `make all` printed only the `cat` line, rebuilt
+          # nothing, and the image it handed to QEMU was upstream's 513-byte
+          # sector plus a 4964-byte ELF -- i.e. every fix in the previous
+          # commit was silently shadowed by a stale artefact. `make clean`
+          # removes them from the runner's copy only; nothing is deleted from
+          # the repository.
+          set -o pipefail
+          echo '--- artefacts that are tracked in git (they must not decide the build):'
+          git ls-files '*.bin' '*.o' | sed 's/^/  /'
+          make clean
+          make all 2>&1 | tee build.log
 
       - name: Inventory build products
         run: |
