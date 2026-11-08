@@ -18,7 +18,12 @@ AS      = nasm
 # -ffreestanding   : don’t assume standard libraries (no glibc)
 # -O2              : optimize for speed
 # -Wall -Wextra    : enable most warnings
-CFLAGS  = -m32 -ffreestanding -O2 -Wall -Wextra
+# -fno-pic -no-pie : the linker below is GNU ld with a flat binary output and
+#                  : no dynamic section; Ubuntu's gcc defaults to PIE, whose
+#                  : GOT-relative calls fail to link ("undefined reference to
+#                  : `_GLOBAL_OFFSET_TABLE_`"). Measured on gcc 13.3.0.
+# CFLAGS  = -m32 -ffreestanding -O2 -Wall -Wextra          # upstream
+CFLAGS  = -m32 -ffreestanding -O2 -Wall -Wextra -fno-pic -no-pie
 
 # -m elf_i386      : produce 32-bit ELF binary
 # -T linker.ld     : use our custom linker script
@@ -44,7 +49,12 @@ boot.asm.bin: boot.asm
 # ------------------------------------------------------
 loader.bin: loader.c linker.ld
 	$(CC) $(CFLAGS) -c loader.c -o loader.o   # compile to object .o
-	$(LD) $(LDFLAGS) loader.o -o loader.bin   # link into flat binary at 0x8000
+	# The comment on the upstream line promised "link into flat binary at
+	# 0x8000", but the command itself only said -T linker.ld, so ld emitted
+	# an ELF: `file loader.bin` = "ELF 32-bit LSB executable", and stage 1
+	# jumped to the bytes 7f 45 4c 46 ("\x7fELF") as if they were code.
+	# $(LD) $(LDFLAGS) loader.o -o loader.bin   # link into flat binary at 0x8000
+	$(LD) $(LDFLAGS) -N --oformat binary -e kmain loader.o -o loader.bin   # really flat now
 
 # ------------------------------------------------------
 # Clean up all generated files
