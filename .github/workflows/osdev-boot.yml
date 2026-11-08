@@ -1,0 +1,133 @@
+name: two-stage bootloader build & boot (nasm + gcc -m32 + QEMU)
+
+# What this workflow does, end to end:
+#
+#   1. installs nasm, gcc with -m32 support (gcc-multilib), GNU ld, `file` and
+#      QEMU -- everything the Makefile names;
+#   2. `make all`, which assembles the 512-byte boot sector, compiles and links
+#      loader.c flat, and concatenates them into boot.bin;
+#   3. checks the arithmetic the concat depends on (sector exactly 512 bytes,
+#      boot.bin exactly 512 + loader.bin) and that loader.bin is a *flat*
+#      binary rather than an ELF;
+#   4. boots the result as a 1.44 MiB floppy (stage 1 reads cylinder 0 / head
+#      0 / sector 2 with CHS, which only a floppy geometry has) and asks the
+#      machine over QMP what the VGA text buffer and EIP say.
+#
+# The run step is the reason this branch exists. Upstream could assemble and
+# compile but the image never reached the C code, for four separate reasons,
+# each measured before it was fixed (see the edidada/main commit and
+# edidada-ci/run_in_qemu.sh):
+#
+#   * loader.bin was an ELF -- the recipe's comment promised a flat binary but
+#     the command had no --oformat, so stage 1 jumped onto 7f 45 4c 46;
+#   * boot.asm.bin was 513 bytes, because `boot_drive: db 0` sits *after*
+#     `dw 0xAA55`, so `cat` started sector 2 one byte late;
+#   * the INT 0x13 read used ES:BX = 0x8000:0 (linear 0x80000) while the jump
+#     and linker.ld both meant linear 0x8000;
+#   * the jump went to 32-bit code while the CPU was still in 16-bit real mode
+#     (measured: EIP wandered 0xb501 -> 0xf961 through the zero fill), and
+#     `sti` before that made the first timer tick triple-fault against the
+#     BIOS's 16-bit IDT gates.
+#
+# Success now looks like: the string loader.c wrote to 0xB8000 on the screen,
+# EIP inside 0x8000-0x8fff, and HLT=1 in a parked state.
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: osdev-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  boot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain (nasm, gcc-multilib, QEMU)
+        run: |
+          set -o pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            nasm gcc-multilib make binutils file \
+            qemu-system-x86 qemu-utils
+          echo '--- identities'
+          nasm -v
+          gcc --version | head -1
+          ld --version | head -1
+          qemu-system-i386 --version | head -1
+          echo '--- 32-bit C support'
+          printf 'int main(void){return 0;}\n' > /tmp/t.c
+          gcc -m32 -ffreestanding -c /tmp/t.c -o /tmp/t.o && echo '-m32 ok'
+
+      - name: Build (make all)
+        run: make all 2>&1 | tee build.log
+
+      - name: Inventory build products
+        run: |
+          ls -l boot.asm.bin loader.bin boot.bin
+          file boot.asm.bin loader.bin boot.bin || true
+          echo '--- boot sector tail: bytes 510/511 must be 0x55 0xAA, and there'
+          echo '    must be nothing after them'
+          od -An -tx1 -j508 -N8 boot.asm.bin
+          echo '--- the far jump stage 1 uses to leave real mode (ea .. .. 08 00)'
+          od -An -tx1 -j64 -N32 boot.asm.bin
+          echo '--- stage 2, disassembled as raw bytes at its link address'
+          objdump -D -b binary -m i386 --adjust-vma=0x8000 loader.bin | sed -n '1,24p'
+
+      - name: Boot in QEMU and verify the screen
+        run: bash edidada-ci/run_in_qemu.sh
+
+      - name: Summarise what was measured
+        if: always()
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, os
+          p = "qemu-report.json"
+          print("## Boot verification")
+          if not os.path.exists(p):
+              print("no qemu-report.json -- the run step did not get that far")
+              raise SystemExit(0)
+          r = json.load(open(p))
+          regs = " ".join(r.get("registers", "").split())
+          def field(name, width=8):
+              i = regs.find(name + "=")
+              return regs[i + len(name) + 1:i + len(name) + 1 + width].strip() if i >= 0 else "?"
+          print("| what | value |")
+          print("|---|---|")
+          print("| guest status | `%s` |" % r.get("guest"))
+          print("| framebuffer captured | %s bytes via `%s` |" %
+                (r.get("vga_bytes", 0), r.get("vga_source")))
+          print("| framebuffer sources | pmemsave file %d bytes, x/4000xb %d bytes, identical=%s |" %
+                (r.get("vga_file_bytes", 0), r.get("x_bytes_len", 0),
+                 r.get("vga_sources_agree")))
+          print("| EIP | `%s` (linker.ld puts stage 2 at 0x8000) |" % field("EIP"))
+          print("| EIP samples | %s (advancing=%s) |" %
+                (r.get("eip_delta"), r.get("advancing")))
+          print("| HLT flag | %s |" % field("HLT", 1))
+          print("| non-blank cells | %s |" % r.get("nonblank_cells"))
+          print("| missing evidence | %s |" % (r.get("missing") or "none"))
+          print()
+          print("Screen text decoded from 0xB8000 -- line 1 is the C string:")
+          for line in r.get("screen", [])[:8] or ["(no printable cells)"]:
+              print("    " + line)
+          PY
+
+      - name: Upload the image and the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: osdev-boot-${{ github.run_number }}
+          path: |
+            boot.bin
+            build.log
+            qemu-report.json
+          if-no-files-found: warn
+          retention-days: 14
